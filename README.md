@@ -370,3 +370,380 @@ A：登录邮箱网页端，进入「已删除」文件夹，手动移回 INBOX 
 核心方法论来自一次真实的大规模邮箱整理实践（7,000+ 封逐封阅读、1,100+ 封人工复核），踩坑经验沉淀于 `references/gotchas.md`。
 
 *愿你的收件箱从此清爽，且重要邮件一封不少。*
+
+---
+
+# English Version
+
+# iCloud Mail Triage & Cleanup Skill
+
+> A reusable pipeline: **Connect mailbox → Model reads each email body to decide → Uncertain ones go to human → Safely clean up via "recoverable folder-to-folder move".**
+>
+> Design principles: **Read the body, not keywords; only do recoverable folder moves, never permanent deletion.**
+
+---
+
+## 1. What it can / cannot do
+
+**Can do**
+- Batch-classify an entire mailbox (thousands to tens of thousands of emails) into three categories: **keep / clean / pending**.
+- Use an LLM to **read each email body** and decide, instead of using keywords or domain statistics (which would wrongly delete orders, bills, admission letters, etc.).
+- Automatically collect "uncertain" emails into a **local human review board** where you decide with a couple of clicks in the browser.
+- **Safely move emails** (INBOX ↔ Deleted) based on decisions, fully recoverable.
+- Validation and independent verification before, during, and after execution, to prevent accidental damage.
+
+**Cannot / will not do**
+- **Will not permanently delete**: only moves emails between folders, never `EXPUNGE`s deleted emails (always recoverable from Trash).
+- **Will not touch emails you marked "keep"**: configurable exclusion list; those emails are never touched.
+- **Does not depend on provider-specific capabilities**: iCloud has no native "MOVE", so this skill uses the IMAP-standard "copy to target + mark source deleted" to achieve the equivalent.
+- Does not process encrypted emails, does not read attachment contents, does not send emails.
+
+---
+
+## 2. Use cases
+
+- Mailbox is overflowing, want to batch-clean junk but afraid of deleting important emails.
+- Need to classify hundreds to thousands of emails (keep / delete / pending).
+- You want "let the model read first, then I personally review the uncertain ones".
+
+**Currently defaults to iCloud / me.com mailboxes** (`imap.mail.me.com`). For other IMAP mailboxes, just change `host`/`port` in credentials; the body-reading and decision logic is fully generic.
+
+---
+
+## 3. Directory structure
+
+```
+icloud-mail-triage/
+├── README.md                 # This file
+├── SKILL.md                  # Trigger conditions & workflow summary for the AI Agent
+├── references/
+│   ├── workflow.md           # End-to-end steps, commands, data contracts
+│   └── gotchas.md            # 10 hard-won lessons from real use
+└── scripts/
+    ├── scan.cjs             # Read-only full metadata scan
+    ├── fetch_bodies.cjs     # Batch fetch bodies (for large-scale review)
+    ├── review_board.py      # Generate the human review board HTML
+    ├── build_actions.py     # Merge model+human+rules, produce & validate action list
+    ├── apply_actions.cjs    # Safe move executor (dry-run / limit / batch / verify)
+    ├── verify.cjs           # Independent double-check after execution
+    └── serve.py             # Local static server for opening the review board in a browser
+```
+
+---
+
+## 4. Installation
+
+### Method A: Unzip the zip (recommended for sharing)
+1. Unzip `icloud-mail-triage.zip` to get the `icloud-mail-triage/` folder.
+2. Drag the whole folder into:
+   - macOS / Linux: `~/.workbuddy/skills/`
+   - Windows: `%USERPROFILE%\.workbuddy\skills\`
+3. The final path should be `~/.workbuddy/skills/icloud-mail-triage/SKILL.md`.
+
+### Method B: Copy the folder directly
+Place the entire `icloud-mail-triage/` directory into the `skills/` directory above.
+
+### Enable MCP (required)
+The "connect / read" stage depends on the `icloud-mail` MCP (read-only). Please connect it in WorkBuddy's MCP configuration first.
+> Reading uses MCP, but **the cleanup stage uses scripts connecting directly to IMAP** (MCP is read-only, with no move/delete tools).
+
+After installation, say "tidy my mailbox / clean up emails / use a model to decide what to delete" in a conversation, and the skill will be triggered.
+
+---
+
+## 5. Prerequisites (one-time)
+
+### 5.1 Dependencies
+- **Node.js ≥ 18** (runs `.cjs` scripts)
+- **Python 3.8+** (runs `.py` scripts)
+- **npm packages** (only needed for the cleanup stage): run in the **working directory**
+  ```bash
+  npm install imapflow iconv-lite
+  ```
+- **icloud-mail MCP** connected (for read-only reading)
+
+### 5.2 Credentials `cred.json`
+Create a working directory (e.g. `~/mail-triage`) and put `cred.json` in it:
+
+```json
+{
+  "host": "imap.mail.me.com",
+  "port": 993,
+  "user": "your-account@icloud.com",
+  "pass": "App-Specific Password"
+}
+```
+
+```bash
+chmod 600 cred.json        # Tighten permissions; never commit to git
+```
+
+> ⚠️ iCloud **must use an App-Specific Password** (appleid.apple.com → Sign-In and Security → App-Specific Passwords), not your Apple ID login password.
+> All scripts read the `ICLOUD_CRED` environment variable (default `./cred.json`). To switch mailbox/path, set `export ICLOUD_CRED=/path/to/cred.json`.
+
+### 5.3 Working directory convention
+All scripts resolve `node_modules` and the default `cred.json` from the **current working directory**, so always `cd` into the working directory before running commands.
+
+```bash
+mkdir -p ~/mail-triage && cd ~/mail-triage
+npm init -y && npm install imapflow iconv-lite
+# Put cred.json here, and copy or symlink this skill's scripts/ here
+```
+
+---
+
+## 6. Quick start (end-to-end, 6 steps)
+
+Below is the shortest usable path. Each command runs in the **working directory**.
+
+```bash
+# ① Connect & scan (read-only, produces scan-result.json for the model to read)
+node scripts/scan.cjs --out=scan-result.json --folders="INBOX,Deleted Messages"
+
+# ② Model reads each email body, produces model-verdicts.json
+#    (done by the AI Agent via MCP get_message / fetch_bodies.cjs; see §7.2)
+
+# ③ Generate the human review board (only v=="review" uncertain emails)
+python3 scripts/review_board.py \
+  --verdicts=model-verdicts.json \
+  --rules=review-rules.json \      # optional
+  --out=review-board.html
+#    Open review-board.html in a 【system browser】 (see §7.3), export review-decisions.json
+
+# ④ Merge & validate (read-only, produces actions.json)
+python3 scripts/build_actions.py \
+  --model=model-verdicts.json \
+  --decisions=review-decisions.json \
+  --rules=review-rules.json \
+  --excluded=excluded.json \        # optional
+  --out=actions.json
+
+# ⑤ Safe cleanup (recoverable move)
+node scripts/apply_actions.cjs --actions=actions.json --dry-run   # preview plan first
+node scripts/apply_actions.cjs --actions=actions.json --limit=5   # trial run of 5
+node scripts/apply_actions.cjs --actions=actions.json            # full run
+
+# ⑥ Independent double-check
+node scripts/verify.cjs --actions=actions.json --model=model-verdicts.json
+```
+
+---
+
+## 7. Stage details
+
+### 7.1 Stage 0 · Prepare working directory & credentials
+See §5. Make sure `cred.json` has 600 permissions and `ICLOUD_CRED` points correctly.
+
+### 7.2 Stage 1 · Connect & scan (read-only)
+- **Prefer MCP** (icloud-mail connected):
+  - `list_folders` lists all folders and counts
+  - `mailbox_profile` statistics (total / read / sender domains / by month)
+  - `list_messages` enumerates metadata of a folder (uid / from / subject / date / flagged…)
+  - `get_message` extracts a single email body (for spot checks)
+- **Batch metadata** via script (faster than repeated MCP calls, produces JSON for the model to read):
+  ```bash
+  node scripts/scan.cjs --out=scan-result.json --folders="INBOX,Deleted Messages,Junk"
+  ```
+  Default scans `INBOX,Deleted Messages,Junk,Sent Messages,Archive`.
+
+### 7.3 Stage 2 · Model reviews each email (read the body!)
+For each email, fetch the **full body** and let the model decide one of three categories:
+
+| Verdict | Meaning |
+|---|---|
+| `rescue` | Human-written / specific matter (admission, onboarding, interview, order/ticket, visa, bill/invoice, grades/diploma, letter with case number, job-application reply) / emotional value / `\Flagged` / personal administrative notice |
+| `junk` | Mass advertising, subscription newsletter, terms update, verification code, security alert, transaction template, survey/feedback invite, pure system auto-notice |
+| `review` | Uncertain (e.g. non-commercial mass notice to all students) — hand to human |
+
+**Hard rule**: must read the BODY and decide per email; **never write regex/keyword/statistics scripts to replace reading**.
+When the body is unparsed (MIME / base64 broken), judge `rescue` or `review` cautiously from `FROM + SUBJECT`, **never judge `junk`** (better to keep than to wrongly delete).
+
+- Spot check / small batches: use MCP `get_message` directly
+- Large batches (thousands): `node scripts/fetch_bodies.cjs --folder=INBOX --uids=all --out=inbox-text.jsonl`
+  - Supports `--uids=file:uids.json` (read UID list from file), `--workers` (default 3), `--batch` (default 100)
+
+Produces `model-verdicts.json` (**array**):
+```json
+[
+  {
+    "uid": 123,
+    "folder": "INBOX",
+    "date": "2024-...",
+    "from": "Zhang San <a@x.com>",
+    "subject": "...",
+    "excerpt": "body summary (for human review)",
+    "why": "decision reason quoting the body",
+    "body": "plain text body, ≤4000 chars",
+    "v": "rescue | junk | review"
+  }
+]
+```
+> Multiple emails from the same sender are often the same category; the model can cluster by sender first, then confirm per email.
+
+### 7.4 Stage 3 · Human reviews "uncertain" emails
+Turn `v == "review"` emails into a **local board** where you view each body and click to decide:
+
+```bash
+python3 scripts/review_board.py \
+  --verdicts=model-verdicts.json \
+  --rules=review-rules.json \     # optional: auto-handle rule-matched, keep out of pending
+  --title="My mailbox review" \
+  --out=review-board.html
+```
+
+**How to open (very important)**: open `review-board.html` in a **system browser**.
+- Recommended: `python3 scripts/serve.py --file=review-board.html` (auto-opens default browser)
+- Or just double-click to open via `file://`
+
+> ⚠️ **Do NOT open the review board in the WorkBuddy built-in preview panel!** Its internal `localStorage` is easy to lose, and copy/download are often blocked by the sandbox — once over 300 verdicts were lost this way (lesson in `references/gotchas.md` #1).
+
+**Page operations**
+- View each body, press `1` (keep / rescue) or `2` (clean / junk) to decide; progress auto-saves in the browser locally.
+- After finishing, click "Export review results" to save `review-decisions.json`.
+- **If copy/download is blocked**: click "Export as copyable text" button, select-all the JSON in the text box and copy, then paste it directly into the conversation.
+
+Exported file structure:
+```json
+{
+  "exported_at": "2026-...",
+  "total": 1058,
+  "decided": 1058,
+  "decisions": [
+    {"uid": 99, "folder": "Deleted Messages", "v": "rescue"},
+    {"uid": 88, "folder": "INBOX", "v": "junk"}
+  ]
+}
+```
+
+### 7.5 Rule shortcut `review-rules.json` (optional, most convenient)
+If you can specify rules like "a certain sender type always keep / restore", you can skip human review and auto-handle:
+
+```json
+{
+  "rules": [
+    {
+      "id": "school",
+      "label": "School mass mail",
+      "action": "keep_in_place",
+      "match": {"folder": "INBOX", "from_contains": ["ec-nantes.fr"]}
+    },
+    {
+      "id": "restore",
+      "label": "Billing system",
+      "action": "restore_to_inbox",
+      "match": {"folder": "Deleted Messages", "from_contains": ["billing@"]}
+    }
+  ]
+}
+```
+- `keep_in_place`: judged "keep as-is", removed from pending.
+- `restore_to_inbox`: judged "restore to INBOX", removed from pending.
+- `from_contains` matches if any substring hits (case-insensitive).
+
+### 7.6 Stage 4 · Merge & validate (read-only)
+Merge **model verdicts + human decisions + rules**, produce an executable action list and do boundary checks:
+
+```bash
+python3 scripts/build_actions.py \
+  --model=model-verdicts.json \
+  --decisions=review-decisions.json \
+  --rules=review-rules.json \
+  --excluded=excluded.json \     # optional: folders/emails never touched
+  --out=actions.json
+```
+
+The script prints a validation report: `duplicate / out-of-bounds (human judged a non-review email) / in exclusion list / invalid value / pending unjudged`.
+**Resolve any anomaly before executing.**
+
+Semantic rules:
+- `rescue` = should end in **INBOX**
+- `junk` = should end in **Deleted Messages** (recoverable, not permanent)
+- Model `rescue`/`junk` emails auto-execute; `review` needs human `decision` override
+- Rule-matched with `action` `keep_in_place` / `restore_to_inbox` are removed from pending
+
+### 7.7 Stage 5 · Safe cleanup (recoverable move)
+```bash
+# 1) dry-run first to preview plan (no mailbox connection, no changes)
+node scripts/apply_actions.cjs --actions=actions.json --dry-run
+
+# 2) trial run of 5 to verify direction
+node scripts/apply_actions.cjs --actions=actions.json --limit=5
+
+# 3) full run (batch ≤200, verify source residue per batch, stop if residue>0, log to actions-log.jsonl)
+node scripts/apply_actions.cjs --actions=actions.json
+```
+
+Before executing, list the full plan with risk warnings for the user to confirm.
+- `--batch=N` adjusts emails per batch (default 200)
+- `--log=path.jsonl` specifies rollback log path (default `actions-log.jsonl`)
+- **Only folder moves throughout, never EXPUNGE the Trash**, so any email can be recovered from Trash.
+
+### 7.8 Stage 6 · Independent double-check
+```bash
+node scripts/verify.cjs --actions=actions.json --model=model-verdicts.json
+```
+Confirm: moved-out source residue 0, restored source residue 0, untouched emails intact, copy at target folder tail, total counts conserved per folder.
+
+---
+
+## 8. Data contract quick reference
+
+| File | Producer | Consumer | Key fields |
+|---|---|---|---|
+| `model-verdicts.json` | Model (Stage 2) | review_board / build_actions | `{uid, folder, v, body, why}` |
+| `review-decisions.json` | Human (Stage 3) | build_actions | `{decisions:[{uid, folder, v}]}` |
+| `review-rules.json` | User | review_board / build_actions | `{rules:[{id, action, match}]}` |
+| `actions.json` | build_actions (Stage 4) | apply_actions / verify | `{actions:[{uid, folder, dest, key, v}]}` |
+| `actions-log.jsonl` | apply_actions (Stage 5) | undo / verify | per-batch rollback record |
+
+> **Composite key**: the two folders (INBOX / Deleted Messages) have independent UID spaces; cross-folder decisions always use composite key `I{uid}` / `D{uid}` to avoid mutual overwrite.
+
+---
+
+## 9. Safety & rollback
+
+- **No permanent deletion**: all cleanup is "copy to target folder + mark source deleted"; deleted emails remain in the "Deleted" folder (Trash), always manually restorable.
+- **Rollback log**: `actions-log.jsonl` records each batch's (uid, source folder, target folder); to undo, move back per the log.
+- **Batch verification**: after each batch move, immediately re-check source folder residue; if residue > 0, stop immediately, never silently miss.
+- **Independent check**: `verify.cjs` re-verifies via a different logic channel than the executor, confirming total conservation and no email vanished.
+- **Exclusion list**: `--excluded=excluded.json` specifies `{items:[{key:"I123"}]}` etc.; these emails are never touched.
+
+---
+
+## 10. FAQ
+
+**Q: I opened the review board in the WorkBuddy preview panel and lost the results. What now?**
+A: This is the pitfall emphasized in §7.4. Always open it in a **system browser** (`serve.py` is easiest). If already lost, you can only redo that part — so save a backup immediately after exporting `review-decisions.json`.
+
+**Q: iCloud won't connect / auth failed?**
+A: Confirm you're using an **App-Specific Password**, not the Apple ID login password; confirm `cred.json`'s `host`/`port` are correct and `ICLOUD_CRED` points to it.
+
+**Q: Can it be used for Gmail / enterprise mail?**
+A: Yes. Just change `host`/`port`/`user`/`pass` in `cred.json` (Gmail needs an app password / OAuth per provider). Reading and decision logic are generic.
+
+**Q: Script errors `Cannot find module 'imapflow'`?**
+A: Run `npm install imapflow iconv-lite` in the **working directory**, and `cd` into it before running commands.
+
+**Q: Want to stop halfway?**
+A: Just Ctrl+C. Executed batches are recorded in `actions-log.jsonl`; unexecuted ones won't move. After stopping, use `verify.cjs` to check status, then decide whether to continue.
+
+**Q: How to recover an important email wrongly moved to "Deleted"?**
+A: Log into the webmail, go to the "Deleted" folder, manually move it back to INBOX (this skill never EXPUNGEs).
+
+---
+
+## 11. Customization & extension
+
+- **Decision criteria**: the `rescue/junk/review` three-way split in Stage 2 can be adjusted to your preference (just change the model prompt; scripts only recognize these three enum values).
+- **Rule file**: use `review-rules.json` to codify "keep / restore a sender", skipping human review — most convenient.
+- **Exclusion list**: `excluded.json` protects emails you never want touched (e.g. certain archive folders).
+- **Batch size / concurrency**: `apply_actions.cjs --batch`, `fetch_bodies.cjs --workers/--batch` are adjustable.
+
+---
+
+## 12. License & acknowledgements
+
+This skill is packaged per the WorkBuddy user-level skill spec and may be freely copied, modified, and redistributed.
+The core methodology comes from a real large-scale mailbox cleanup (7,000+ emails read one by one, 1,100+ human-reviewed); the lessons are distilled in `references/gotchas.md`.
+
+*May your inbox be tidy from now on, with not a single important email lost.*
